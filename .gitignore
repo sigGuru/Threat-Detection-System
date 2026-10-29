@@ -1,0 +1,53 @@
+HELP.md
+
+# Maven build output
+target/
+**/target/
+
+# Runtime-generated uploads and local data
+uploads/*
+!uploads/.gitkeep
+*.log
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+application-local.properties
+application-*.properties
+!.github/
+
+# Java and IDE-generated files
+*.class
+*.war
+.classpath
+.factorypath
+.project
+.settings/
+.springBeans
+.sts4-cache
+.apt_generated/
+
+### STS ###
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+
+### VS Code ###
+.vscode/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini
