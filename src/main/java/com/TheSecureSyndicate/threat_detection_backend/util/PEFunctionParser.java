@@ -4,7 +4,10 @@ import io.github.struppigel.parser.PELoader;
 import io.github.struppigel.parser.PEData;
 import io.github.struppigel.parser.coffheader.COFFFileHeader;
 import io.github.struppigel.parser.optheader.OptionalHeader;
+import io.github.struppigel.parser.optheader.StandardFieldEntryKey;
+import io.github.struppigel.parser.optheader.WindowsEntryKey;
 import io.github.struppigel.parser.sections.SectionHeader;
+import io.github.struppigel.parser.sections.SectionHeaderKey;
 import io.github.struppigel.parser.sections.SectionTable;
 import io.github.struppigel.parser.sections.edata.ExportEntry;
 import io.github.struppigel.parser.sections.idata.ImportDLL;
@@ -15,6 +18,7 @@ import com.TheSecureSyndicate.threat_detection_backend.model.PESectionInfo;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -445,39 +449,42 @@ public class PEFunctionParser {
             result.setCharacteristics(coff.getCharacteristics() != null ? coff.getCharacteristics().toString() : "");
         }
 
-        // Optional header (reflection-based)
+        // Optional header
         if (optional != null) {
-            // ENTRY POINT: try numeric methods, then descriptive fields
-            Long entryPoint = getOptionalHeaderLong(optional,
-                    "getAddressOfEntryPoint", "getAddressOfEntryPoint0", "getEntryPoint", "getEntryPointValue", "getEntry");
-            if (entryPoint == null) {
-                // try common alternative method names found in struppigel outputs
-                entryPoint = getOptionalHeaderLong(optional, "getStandardFieldsInfo", "getStandardFields", "getInfo");
+            long entryPoint = 0L;
+            try {
+                entryPoint = optional.get(StandardFieldEntryKey.ADDR_OF_ENTRY_POINT);
+            } catch (Exception e) {
+                Long ep = getOptionalHeaderLong(optional, "getAddressOfEntryPoint", "getEntryPoint");
+                if (ep != null) entryPoint = ep;
             }
-            // Additional fallback: parse from getStandardFieldsInfo text
-            if (entryPoint == null) {
-                Object info = safeInvokeObject(optional, "getStandardFieldsInfo", "getInfo");
-                entryPoint = parseLongFromObject(info);
+            result.setEntryPoint(entryPoint);
+
+            long imageBase = 0L;
+            try {
+                imageBase = optional.get(WindowsEntryKey.IMAGE_BASE);
+            } catch (Exception e) {
+                Long ib = getOptionalHeaderLong(optional, "getImageBase", "getBaseOfImage");
+                if (ib != null) imageBase = ib;
             }
-            result.setEntryPoint(entryPoint != null ? entryPoint : 0L);
+            result.setImageBase(imageBase);
 
-            // IMAGE BASE
-            Long imageBase = getOptionalHeaderLong(optional,
-                    "getImageBase", "getRelocatedImageBase", "getRelocatedImageBase0", "getBaseOfImage");
-            if (imageBase == null) {
-                Object winspec = safeInvokeObject(optional, "getWindowsSpecificInfo", "getWindowsSpecificFields", "getWindowsSpecificInfo");
-                imageBase = parseLongFromObject(winspec);
+            try {
+                result.setSubsystem(optional.getSubsystem() != null ? optional.getSubsystem().name() : "UNKNOWN");
+            } catch (Exception e) {
+                String sub = getOptionalHeaderString(optional, "getSubsystem", "subsystem");
+                result.setSubsystem(sub != null ? sub : "UNKNOWN");
             }
-            result.setImageBase(imageBase != null ? imageBase : 0L);
 
-            String subsystem = getOptionalHeaderString(optional, "getSubsystem", "subsystem");
-            result.setSubsystem(subsystem != null ? subsystem : "UNKNOWN");
+            try {
+                result.setDllCharacteristics(optional.getDllCharacteristics() != null ? optional.getDllCharacteristics().toString() : "");
+            } catch (Exception e) {
+                String dc = getOptionalHeaderString(optional, "getDllCharacteristics", "dllCharacteristics");
+                result.setDllCharacteristics(dc != null ? dc : "");
+            }
 
-            String dllChars = getOptionalHeaderString(optional, "getDllCharacteristics", "getDllCharacteristicsAsString", "dllCharacteristics");
-            result.setDllCharacteristics(dllChars != null ? dllChars : "");
-
-            logger.debug("PE Optional Header raw: entryPoint={}, imageBase={}, subsystem={}, dllChars={}",
-                    entryPoint, imageBase, subsystem, dllChars);
+            logger.debug("PE Optional Header: entryPoint=0x{}, imageBase=0x{}, subsystem={}",
+                    Long.toHexString(result.getEntryPoint()), Long.toHexString(result.getImageBase()), result.getSubsystem());
         } else {
             logger.warn("OptionalHeader is null for file: {}", peFile.getName());
         }
@@ -488,39 +495,65 @@ public class PEFunctionParser {
                 if (section == null) continue;
                 PESectionInfo info = new PESectionInfo();
 
-                // Reflection-based extraction - try methods we saw in debug output
-                String name = getString(section, "getName", "name", "getUnfilteredName");
-                // The library exposes methods like getAlignedVirtualSize/getAlignedSizeOfRaw etc.
-                Long virtualSize = getLong(section,
-                        "getAlignedVirtualSize", "getAlignedSizeOfRaw", "getVirtualSize", "getSize", "getAlignedSizeOfRaw");
-                Long rawSize = getLong(section,
-                        "getAlignedSizeOfRaw", "getAlignedPointerToRaw", "getSizeOfRawData", "getSize", "getRawSize");
-                Long rva = getLong(section,
-                        "getAlignedVirtualAddress", "getAlignedVirtualAddress", "getVirtualAddress", "getVirtualAddr", "getVirtualAddress", "getVirtualAddress0", "getRVA");
-                Double entropy = getDouble(section, "getEntropy", "entropy");
+                String name = section.getName() != null ? section.getName() : "UNKNOWN";
+                long virtualSize = 0L;
+                long rawSize = 0L;
+                long rva = 0L;
+                long pointerToRaw = 0L;
 
-                // If still null, attempt to parse from textual outputs like getInfo() or getEntryMap()
-                if (virtualSize == null) {
-                    Object infoObj = safeInvokeObject(section, "getInfo", "getEntryMap", "toString");
-                    virtualSize = parseLongFromObject(infoObj);
-                }
-                if (rawSize == null) {
-                    Object infoObj = safeInvokeObject(section, "getEntryMap", "getInfo", "toString");
-                    rawSize = parseLongFromObject(infoObj);
-                }
-                if (rva == null) {
-                    Object infoObj = safeInvokeObject(section, "getEntryMap", "getInfo", "toString");
-                    rva = parseLongFromObject(infoObj);
+                try {
+                    virtualSize = section.get(SectionHeaderKey.VIRTUAL_SIZE);
+                } catch (Exception e) {
+                    Long vs = getLong(section, "getVirtualSize", "getAlignedVirtualSize");
+                    if (vs != null) virtualSize = vs;
                 }
 
-                String characteristics = getString(section, "getCharacteristics", "characteristics", "toString");
+                try {
+                    rawSize = section.get(SectionHeaderKey.SIZE_OF_RAW_DATA);
+                } catch (Exception e) {
+                    Long rs = getLong(section, "getSizeOfRawData", "getAlignedSizeOfRaw");
+                    if (rs != null) rawSize = rs;
+                }
+
+                try {
+                    rva = section.get(SectionHeaderKey.VIRTUAL_ADDRESS);
+                } catch (Exception e) {
+                    Long va = getLong(section, "getVirtualAddress", "getAlignedVirtualAddress");
+                    if (va != null) rva = va;
+                }
+
+                try {
+                    pointerToRaw = section.get(SectionHeaderKey.POINTER_TO_RAW_DATA);
+                } catch (Exception ignored) {}
+
+                String characteristics = section.getCharacteristics() != null ? section.getCharacteristics().toString() : "";
                 characteristics = truncateCharacteristics(characteristics);
 
-                info.setName(name != null ? name : "UNKNOWN");
-                info.setVirtualSize(virtualSize != null ? virtualSize : 0L);
-                info.setRawSize(rawSize != null ? rawSize : 0L);
-                info.setRva(rva != null ? rva : 0L);
-                info.setEntropy(entropy != null ? entropy : 0.0);
+                // Compute exact Shannon entropy (0.0 to 8.0) directly from section raw data
+                double entropy = 0.0;
+                if (rawSize > 0 && pointerToRaw >= 0 && (pointerToRaw + rawSize <= peFile.length() + 4096)) {
+                    try (RandomAccessFile raf = new RandomAccessFile(peFile, "r")) {
+                        raf.seek(pointerToRaw);
+                        int readLen = (int) Math.min(rawSize, Math.min(peFile.length() - pointerToRaw, 10 * 1024 * 1024L));
+                        if (readLen > 0) {
+                            byte[] sectionBytes = new byte[readLen];
+                            raf.readFully(sectionBytes);
+                            entropy = EntropyUtil.calculateEntropy(sectionBytes);
+                        }
+                    } catch (Exception e) {
+                        logger.debug("Could not compute raw entropy for section {}: {}", name, e.getMessage());
+                    }
+                }
+
+                // Ensure clean clamping (0.000 to 8.000)
+                entropy = Math.max(0.0, Math.min(8.0, entropy));
+                entropy = Math.round(entropy * 1000.0) / 1000.0;
+
+                info.setName(name);
+                info.setVirtualSize(virtualSize);
+                info.setRawSize(rawSize);
+                info.setRva(rva);
+                info.setEntropy(entropy);
                 info.setCharacteristics(characteristics != null ? characteristics : "");
 
                 result.getSections().add(info);
@@ -769,17 +802,40 @@ public class PEFunctionParser {
     public static boolean isPacked(PEHeaderResult header) {
         if (header == null || header.getSections() == null || header.getSections().isEmpty()) return false;
 
-        int suspiciousSections = 0;
         for (PESectionInfo section : header.getSections()) {
             if (section == null) continue;
-            Double ent = section.getEntropy();
+            String secName = section.getName() != null ? section.getName().trim().toUpperCase() : "";
+
+            // Check 1: Known packer section signatures (UPX, ASPack, MPRESS, etc.)
+            if (secName.startsWith("UPX") || secName.startsWith(".UPX") ||
+                secName.contains("ASPACK") || secName.contains("MPRESS") ||
+                secName.contains("FSG") || secName.contains("MEW") ||
+                secName.contains("THEMIDA") || secName.contains("VMP") ||
+                secName.contains("PECOMPACT") || secName.startsWith(".NSP")) {
+                return true;
+            }
+
+            // Check 2: Unpack buffer anomaly (0 raw size with executable virtual size)
             Long raw = section.getRawSize();
             Long vs = section.getVirtualSize();
-            if (ent != null && ent >= 7.0) suspiciousSections++;
-            if (raw != null && raw > 0 && vs != null && (vs / (double) raw) > 5.0) suspiciousSections++;
+            String chars = section.getCharacteristics() != null ? section.getCharacteristics().toUpperCase() : "";
+            if (chars.contains("EXECUTE") && (raw == null || raw == 0) && (vs != null && vs > 2048)) {
+                return true;
+            }
+
+            // Check 3: Virtual size vastly exceeding raw size (ratio > 8:1) in executable sections
+            if (chars.contains("EXECUTE") && raw != null && raw > 0 && vs != null && ((double) vs / raw > 8.0)) {
+                return true;
+            }
+
+            // Check 4: Extremely high entropy in executable sections (> 7.4) with substantial size
+            Double ent = section.getEntropy();
+            if (chars.contains("EXECUTE") && ent != null && ent >= 7.4 && raw != null && raw > 4096) {
+                return true;
+            }
         }
 
-        return suspiciousSections >= Math.ceil(header.getSections().size() / 2.0);
+        return false;
     }
     
     

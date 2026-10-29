@@ -107,86 +107,7 @@ public class StaticAnalysisService {
     // HEADER & SECTION PARSING
     // ========================================================
     public static PEHeaderResult extractHeaderAndSections(File peFile) throws Exception {
-        Objects.requireNonNull(peFile, "peFile cannot be null");
-
-        PEData data = PELoader.loadPE(peFile);
-        if (data == null) return null;
-
-        COFFFileHeader coff = data.getCOFFFileHeader();
-        OptionalHeader optional = data.getOptionalHeader();
-        SectionTable secTable = data.getSectionTable();
-
-        PEHeaderResult result = new PEHeaderResult();
-        result.setFilename(peFile.getName() != null ? peFile.getName() : "unknown");
-
-        // COFF Header
-        if (coff != null) {
-            result.setMachineType(coff.getMachineType() != null ? coff.getMachineType().name() : "UNKNOWN");
-            Date dt = coff.getTimeDate();
-            result.setTimestamp(dt != null ? dt.getTime() : 0L);
-            result.setNumSections(coff.getNumberOfSections());
-            result.setCharacteristics(coff.getCharacteristics() != null ? coff.getCharacteristics().toString() : "");
-        }
-
-        // Optional Header
-        if (optional != null) {
-            Long entryPoint = getOptionalHeaderLong(optional, "getAddressOfEntryPoint", "getEntryPoint");
-            Long imageBase = getOptionalHeaderLong(optional, "getImageBase", "getBaseOfImage");
-            String subsystem = getOptionalHeaderString(optional, "getSubsystem", "subsystem");
-            String dllChars = getOptionalHeaderString(optional, "getDllCharacteristics", "dllCharacteristics");
-
-            result.setEntryPoint(entryPoint != null ? entryPoint : 0L);
-            result.setImageBase(imageBase != null ? imageBase : 0L);
-            result.setSubsystem(subsystem != null ? subsystem : "UNKNOWN");
-            result.setDllCharacteristics(dllChars != null ? dllChars : "");
-        }
-
-        // SECTION TABLE
-        if (secTable != null && secTable.getSectionHeaders() != null) {
-            for (SectionHeader section : secTable.getSectionHeaders()) {
-                if (section == null) continue;
-                PESectionInfo info = new PESectionInfo();
-
-                String name = getString(section, "getName", "name", "getUnfilteredName");
-                Long virtualSize = getLong(section, "getVirtualSize", "getAlignedVirtualSize");
-                Long rawSize = getLong(section, "getSizeOfRawData", "getAlignedSizeOfRaw");
-                Long rva = getLong(section, "getVirtualAddress", "getAlignedVirtualAddress");
-                Double entropy = getDouble(section, "getEntropy", "entropy");
-
-                if (virtualSize == null) virtualSize = 0L;
-                if (rawSize == null) rawSize = 0L;
-                if (rva == null) rva = 0L;
-
-                String characteristics = getString(section, "getCharacteristics", "characteristics", "toString");
-                characteristics = truncateCharacteristics(characteristics);
-
-                // Clamp entropy safely (0.0–8.0)
-                if (entropy == null || Double.isNaN(entropy)) {
-                    entropy = 0.0;
-                } else {
-                    while (entropy > 8.0) entropy /= 10.0;
-                    entropy = Math.min(8.0, Math.max(0.0, entropy));
-                    entropy = Math.round(entropy * 1000.0) / 1000.0;
-                }
-
-                info.setName(name != null ? name : "UNKNOWN");
-                info.setVirtualSize(virtualSize);
-                info.setRawSize(rawSize);
-                info.setRva(rva);
-                info.setEntropy(entropy);
-                info.setCharacteristics(characteristics != null ? characteristics : "");
-
-                result.getSections().add(info);
-            }
-        }
-
-        logger.info("✅ Parsed PE: MachineType={}, EntryPoint=0x{}, ImageBase=0x{}, Sections={}",
-                result.getMachineType(),
-                Long.toHexString(result.getEntryPoint()),
-                Long.toHexString(result.getImageBase()),
-                result.getSections().size());
-
-        return result;
+        return PEFunctionParser.extractHeaderAndSections(peFile);
     }
 
     // ========================================================
@@ -196,20 +117,18 @@ public class StaticAnalysisService {
         AnalysisResult result = new AnalysisResult();
         try {
             File peFile = new File(binary.getFilePath());
-            // use the shared extractor from this service (which returns PEFunctionParser.PEHeaderResult)
             PEHeaderResult header = extractHeaderAndSections(peFile);
 
             result.setBinaryId(binary.getId());
             result.setFilename(binary.getOriginalFilename());
-            result.setClassification(header != null ? "suspicious" : "clean");
-            // use the canonical isPacked() from PEFunctionParser
+            result.setClassification("clean");
             result.setPacked(header != null && PEFunctionParser.isPacked(header));
             result.setHeaderResult(header);
 
-            logger.info("🧩 Static Analysis: {} -> Machine: {}, EP: {}, Packed: {}",
+            logger.info("🧩 Static Analysis: {} -> Machine: {}, EP: 0x{}, Packed: {}",
                     binary.getOriginalFilename(),
                     header != null ? header.getMachineType() : "unknown",
-                    header != null ? header.getEntryPoint() : 0,
+                    Long.toHexString(header != null ? header.getEntryPoint() : 0L),
                     result.isPacked());
 
         } catch (Exception e) {

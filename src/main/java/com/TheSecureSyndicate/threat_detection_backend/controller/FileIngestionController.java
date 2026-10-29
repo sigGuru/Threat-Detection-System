@@ -10,6 +10,10 @@ import com.TheSecureSyndicate.threat_detection_backend.repository.BinaryFileRepo
 //import com.TheSecureSyndicate.threat_detection_backend.service.CuckooSandboxService;
 import com.TheSecureSyndicate.threat_detection_backend.service.FileStorageService;
 import com.TheSecureSyndicate.threat_detection_backend.service.StaticAnalysisService;
+import com.TheSecureSyndicate.threat_detection_backend.service.YaraScanService;
+import com.TheSecureSyndicate.threat_detection_backend.service.MLScoringService;
+import com.TheSecureSyndicate.threat_detection_backend.model.YaraResult;
+import com.TheSecureSyndicate.threat_detection_backend.dto.MLResponse;
 import com.TheSecureSyndicate.threat_detection_backend.util.EntropyUtil;
 import com.TheSecureSyndicate.threat_detection_backend.util.FuzzyHashUtil;
 import com.TheSecureSyndicate.threat_detection_backend.util.HashUtil;
@@ -27,7 +31,9 @@ import java.io.File;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 
@@ -36,7 +42,7 @@ import java.util.UUID;
 public class FileIngestionController {
 
     private static final Logger logger = LoggerFactory.getLogger(FileIngestionController.class);
-    private static final long MAX_ALLOWED_SIZE = 10 * 1024 * 1024; // 10 MB
+    private static final long MAX_ALLOWED_SIZE = 100 * 1024 * 1024L; // 100 MB
     private static final Set<String> ALLOWED_TYPES = Set.of(
             "application/x-dosexec",
             "application/octet-stream",
@@ -46,21 +52,24 @@ public class FileIngestionController {
     private final FileStorageService fileStorageService;
     private final BinaryFileRepository binaryFileRepository;
     private final AnalysisResultRepository analysisResultRepository;
-//    private final CuckooSandboxService cuckooSandboxService;
     private final StaticAnalysisService staticAnalysisService;
+    private final YaraScanService yaraScanService;
+    private final MLScoringService mlScoringService;
 
     public FileIngestionController(
             FileStorageService fileStorageService,
             BinaryFileRepository binaryFileRepository,
             AnalysisResultRepository analysisResultRepository,
-//            CuckooSandboxService cuckooSandboxService,
-            StaticAnalysisService staticAnalysisService
+            StaticAnalysisService staticAnalysisService,
+            YaraScanService yaraScanService,
+            MLScoringService mlScoringService
     ) {
         this.fileStorageService = fileStorageService;
         this.binaryFileRepository = binaryFileRepository;
         this.analysisResultRepository = analysisResultRepository;
-//        this.cuckooSandboxService = cuckooSandboxService;
         this.staticAnalysisService = staticAnalysisService;
+        this.yaraScanService = yaraScanService;
+        this.mlScoringService = mlScoringService;
     }
 
     @PostMapping("/upload")
@@ -104,45 +113,57 @@ public class FileIngestionController {
             if (functions != null) {
                 result.setImportedFunctions(functions.getImportedFunctions());
                 result.setExportedFunctions(functions.getExportedFunctions());
-                logger.info("Imported Functions: {}", functions.getImportedFunctions());
-                logger.info("Exported Functions: {}", functions.getExportedFunctions());
+                logger.info("Imported Functions count: {}", functions.getImportedFunctions().size());
             }
         } catch (Exception e) {
             logger.warn("Failed to parse PE functions: {}", e.getMessage());
         }
 
-        // 🔍 PE header + section parsing
+        // 🔍 YARA pattern scan
+        YaraResult yaraResult = null;
         try {
-            PEHeaderResult header = PEFunctionParser.extractHeaderAndSections(savedPath.toFile());
-            if (header != null) {
-                // set filename from canonical source
-                header.setFilename(binary.getOriginalFilename());
-                result.setHeaderResult(header);
-
-                logger.info("PE Machine Type: {}", header.getMachineType());
-                logger.info("Entry Point: 0x{}", Long.toHexString(header.getEntryPoint()));
-                logger.info("Image Base: 0x{}", Long.toHexString(header.getImageBase()));
-                logger.info("Subsystem: {}", header.getSubsystem());
-                logger.info("Sections count: {}", header.getSections().size());
-                for (PESectionInfo s : header.getSections()) {
-                    logger.info("Section: {} RVA=0x{} Entropy={}", s.getName(), Long.toHexString(s.getRva()), s.getEntropy());
-                }
-                result.setPacked(PEFunctionParser.isPacked(header));
-            } else {
-                logger.warn("extractHeaderAndSections returned null for file: {}", savedPath);
+            yaraResult = yaraScanService.scanFile(savedPath, binary.getId());
+            if (yaraResult != null) {
+                result.setYaraMatched(yaraResult.isMatched());
+                result.setMatchedRules(parseMatchedRules(yaraResult.getMatchedRules()));
+                logger.info("YARA Scan: matched={}, rules={}", yaraResult.isMatched(), yaraResult.getMatchedRules());
             }
         } catch (Exception e) {
-            logger.warn("Failed to parse PE headers/sections: {}", e.getMessage());
+            logger.warn("YARA scan encountered an issue: {}", e.getMessage());
         }
 
+        // 🔍 ML / Heuristic risk scoring
+        try {
+            MLResponse mlResponse = mlScoringService.scoreBinary(binary, yaraResult);
+            if (mlResponse != null) {
+                result.setMlRiskScore(mlResponse.getRiskScore());
+                logger.info("ML Risk Score: {}, Heuristic verdict: {}", mlResponse.getRiskScore(), mlResponse.getClassification());
+            }
+        } catch (Exception e) {
+            logger.warn("ML scoring encountered an issue: {}", e.getMessage());
+        }
+
+        // 🔍 Calibrated Threat Classification
+        String classification = "clean";
+        if (result.isYaraMatched()) {
+            classification = "malicious";
+        } else if (result.getMlRiskScore() > 0.70) {
+            classification = "malicious";
+        } else if (result.getMlRiskScore() > 0.40) {
+            classification = "suspicious";
+        } else {
+            classification = "clean";
+        }
+        result.setClassification(classification);
+
+        analysisResultRepository.save(result);
         Files.deleteIfExists(savedPath);
-//        cuckooSandboxService.submitBinary(binary);
 
         // choose filename in order of trust: header -> binary -> "unknown"
         String responseFilename = "unknown";
         if (result.getHeaderResult() != null && result.getHeaderResult().getFilename() != null && !result.getHeaderResult().getFilename().isBlank()) {
             responseFilename = result.getHeaderResult().getFilename();
-        } else if (binary != null && binary.getOriginalFilename() != null && !binary.getOriginalFilename().isBlank()) {
+        } else if (binary.getOriginalFilename() != null && !binary.getOriginalFilename().isBlank()) {
             responseFilename = binary.getOriginalFilename();
         }
 
@@ -201,38 +222,54 @@ public class FileIngestionController {
             if (functions != null) {
                 result.setImportedFunctions(functions.getImportedFunctions());
                 result.setExportedFunctions(functions.getExportedFunctions());
-                logger.info("Imported Functions: {}", functions.getImportedFunctions());
-                logger.info("Exported Functions: {}", functions.getExportedFunctions());
             }
         } catch (Exception e) {
             logger.warn("Failed to parse PE functions: {}", e.getMessage());
         }
 
-        // 🔍 PE header + section parsing
+        // 🔍 YARA pattern scan
+        YaraResult yaraResult = null;
         try {
-            PEHeaderResult header = PEFunctionParser.extractHeaderAndSections(savedPath.toFile());
-            if (header != null) {
-                header.setFilename(binary.getOriginalFilename());
-                result.setHeaderResult(header);
-                result.setPacked(PEFunctionParser.isPacked(header));
-
-                logger.info("Machine Type: {}", header.getMachineType());
-                logger.info("Entry Point: 0x{}", Long.toHexString(header.getEntryPoint()));
-            } else {
-                logger.warn("extractHeaderAndSections returned null for file: {}", savedPath);
+            yaraResult = yaraScanService.scanFile(savedPath, binary.getId());
+            if (yaraResult != null) {
+                result.setYaraMatched(yaraResult.isMatched());
+                result.setMatchedRules(parseMatchedRules(yaraResult.getMatchedRules()));
             }
         } catch (Exception e) {
-            logger.warn("Failed to parse PE headers/sections: {}", e.getMessage());
+            logger.warn("YARA scan encountered an issue: {}", e.getMessage());
         }
 
+        // 🔍 ML / Heuristic risk scoring
+        try {
+            MLResponse mlResponse = mlScoringService.scoreBinary(binary, yaraResult);
+            if (mlResponse != null) {
+                result.setMlRiskScore(mlResponse.getRiskScore());
+            }
+        } catch (Exception e) {
+            logger.warn("ML scoring encountered an issue: {}", e.getMessage());
+        }
+
+        // 🔍 Calibrated Threat Classification
+        String classification = "clean";
+        if (result.isYaraMatched()) {
+            classification = "malicious";
+        } else if (result.getMlRiskScore() > 0.70) {
+            classification = "malicious";
+        } else if (result.getMlRiskScore() > 0.40) {
+            classification = "suspicious";
+        } else {
+            classification = "clean";
+        }
+        result.setClassification(classification);
+
+        analysisResultRepository.save(result);
         Files.deleteIfExists(savedPath);
-//        cuckooSandboxService.submitBinary(binary);
 
         // choose filename in order of trust: header -> binary -> "unknown"
         String responseFilename = "unknown";
         if (result.getHeaderResult() != null && result.getHeaderResult().getFilename() != null && !result.getHeaderResult().getFilename().isBlank()) {
             responseFilename = result.getHeaderResult().getFilename();
-        } else if (binary != null && binary.getOriginalFilename() != null && !binary.getOriginalFilename().isBlank()) {
+        } else if (binary.getOriginalFilename() != null && !binary.getOriginalFilename().isBlank()) {
             responseFilename = binary.getOriginalFilename();
         }
 
@@ -252,5 +289,19 @@ public class FileIngestionController {
         );
 
         return ResponseEntity.ok(response);
+    }
+
+    private List<String> parseMatchedRules(String matchedRulesStr) {
+        List<String> list = new ArrayList<>();
+        if (matchedRulesStr != null && !matchedRulesStr.isBlank()) {
+            String[] tokens = matchedRulesStr.split("[\\r\\n,]+");
+            for (String t : tokens) {
+                String trimmed = t.trim();
+                if (!trimmed.isEmpty()) {
+                    list.add(trimmed);
+                }
+            }
+        }
+        return list;
     }
 }
